@@ -1,16 +1,21 @@
 use crossterm::{event::*, terminal::ClearType};
-use crossterm::{cursor, event, execute, queue, terminal};
-// use std::io::stdout;
-// use std::io::{self, Write, stdout};
-use std::time::Duration;
+use crossterm::{cursor, event, execute, queue, style, terminal};
+use std::time::{Duration, Instant};
 use std::{
-    cmp,
     env,
     fs,
-    vec,
-    path::Path,
+    // vec,
+    path::PathBuf,
     io::{self, Write, stdout}
 };
+use std::cmp;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const NAME: &str = env!("CARGO_PKG_NAME");
+const TAB_STOP: usize = 4;
+const MSG_TTL: u64 = 5;
+const NO_FILE_NAME: &str = "[No Name]";
+const HELP_MSG: &str = "Ctrl + Q to Quit";
 
 struct CleanUp;
 
@@ -21,24 +26,64 @@ impl Drop for CleanUp {
     }
 }
 
+struct StatusMessage {
+    message: Option<String>,
+    set_time: Option<Instant>,
+}
+
+impl StatusMessage {
+    fn new(initial_message: String) -> Self {
+        Self {
+            message: Some(initial_message),
+            set_time: Some(Instant::now()),
+        }
+    }
+
+    fn set_message(&mut self, message: String) {
+        self.message = Some(message);
+        self.set_time = Some(Instant::now())
+    }
+
+    fn message(&mut self) -> Option<&String> {
+        self.set_time.and_then(|time| {
+            if time.elapsed() > Duration::from_secs(MSG_TTL) {
+                self.message = None;
+                self.set_time = None;
+                None
+            } else {
+                Some(self.message.as_ref().unwrap())
+            }
+        })
+    }
+    
+}
+
 struct Output {
     win_size: (usize, usize),
     editor_contents: EditorContents,
     editor_rows: EditorRows,
     cursor_controller: CursorController,
+    status_message: StatusMessage,
+    max_line_nr_digits: usize,
 }
 
 impl Output {
     fn new() -> Self {
         let win_size = terminal::size()
-            .map(|(x, y)| (x as usize, y as usize))
+            .map(|(x, y)| (x as usize, y as usize - 2))
             .unwrap();
-        Self {
+        let mut out = Self {
             win_size,
+            max_line_nr_digits: 0,
             editor_contents: EditorContents::new(),
             editor_rows: EditorRows::new(),
             cursor_controller: CursorController::new(win_size),
-        }
+            status_message: StatusMessage::new(HELP_MSG.into()),
+        };
+        
+        out.max_line_nr_digits = out.editor_rows.nr_of_rows().checked_ilog10().unwrap_or(0) as usize + 1; // god I love rust
+
+        out
     }
 
     fn clear_screen() -> io::Result<()> {
@@ -46,15 +91,77 @@ impl Output {
         execute!(stdout(), cursor::MoveTo(0, 0))
     }
 
+    fn insert_char(&mut self, ch: char) {
+        if self.cursor_controller.cursor_y == self.editor_rows.nr_of_rows() {
+            self.editor_rows.insert_row()
+        }
+        self.editor_rows
+            .get_editor_row_mut(self.cursor_controller.cursor_y)
+            .insert_char(self.cursor_controller.cursor_x, ch);
+        self.cursor_controller.cursor_x += 1;
+        // self.cursor_controller.prev_cursor_x = self.cursor_controller.cursor_x;
+    }
+
+    fn draw_status_line(&mut self) {
+        self.editor_contents
+            .push_str(&style::Attribute::Reverse.to_string());
+
+        let status = format!(
+            "{} -- {} ", 
+            self.editor_rows
+                .file_name
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or(NO_FILE_NAME),
+            self.editor_rows.nr_of_rows()
+        );
+        let status_len = cmp::min(status.len(), self.win_size.0);
+
+        let cursor_info = format!(
+            "{}:{}",
+            self.cursor_controller.cursor_y + 1,
+            self.cursor_controller.cursor_x + 1
+        );
+
+        self.editor_contents.push_str(&status[..status_len]);
+        for i in status_len..self.win_size.0 {
+            if self.win_size.0 - i == cursor_info.len() {
+                self.editor_contents.push_str(&cursor_info);
+                break;
+            }
+            self.editor_contents.push(' ')
+        }
+        
+        self.editor_contents
+            .push_str(&style::Attribute::Reset.to_string());
+
+        self.editor_contents.push_str("\r\n");
+    }
+
+    fn draw_status_message(&mut self) {
+        queue!(
+            self.editor_contents,
+            terminal::Clear(ClearType::UntilNewLine)
+        )
+        .unwrap();
+
+        if let Some(msg) = self.status_message.message() {
+            self.editor_contents
+                .push_str(&msg[..cmp::min(self.win_size.0, msg.len())]);
+        }
+    }
+
     fn draw_rows(&mut self) {
-        let version = "0.0.1";
         let screen_rows = self.win_size.1;
         let screen_cols = self.win_size.0;
 
         for i in 0..screen_rows {
-            if i >= self.editor_rows.nr_of_rows() {
+            let file_row = i + self.cursor_controller.row_offset;
+
+            if file_row >= self.editor_rows.nr_of_rows() {
                 if self.editor_rows.nr_of_rows() == 0 && i == screen_rows / 3 {
-                    let mut welcome = format!("V2! --- v{}", version);
+                    let mut welcome = format!("{}! --- v{}", NAME.to_uppercase(), VERSION);
                     if welcome.len() > screen_cols {
                         welcome.truncate(screen_cols)
                     }
@@ -67,12 +174,35 @@ impl Output {
                     self.editor_contents.push_str(&welcome);
                 } else {
                     self.editor_contents.push('~');
+                    // self.editor_contents.push_str(&((i + 1).to_string() + "  "));
                 }
 
             } else {
-                let len = cmp::min(self.editor_rows.get_row(i).len(), screen_cols);
+                let row = self.editor_rows.get_render(file_row);
+                let col_offset = self.cursor_controller.col_offset;
+                let line_nr_str = (i + 1 + self.cursor_controller.row_offset).to_string();
+                let line_nr_formatted = format!("{:>pad$}{}",
+                                                line_nr_str,
+                                                " ",
+                                                pad = self.max_line_nr_digits);
+
+                self.editor_contents.push_str(&(line_nr_formatted)); // vim :set nornu basically
+
+                let len = if row.len() < col_offset {
+                    0
+                } else {
+                    let len = row.len() - col_offset;
+                    if len > screen_cols {
+                        screen_cols 
+                    } else {
+                        len
+                    }
+                };
+
+                let start = if len == 0 { 0 } else { col_offset };
+
                 self.editor_contents
-                    .push_str(&self.editor_rows.get_row(i)[..len])
+                    .push_str(&(row[start..start + len]));
             }
 
             queue!(
@@ -80,27 +210,36 @@ impl Output {
                 terminal::Clear(ClearType::UntilNewLine)
             ).unwrap();
 
-            if i < screen_rows - 1 {
+            // if i < screen_rows - 1 {
                 self.editor_contents.push_str("\r\n");
-            }
+            // }
         }
     }
 
     fn refresh_screen(&mut self) -> io::Result<()> {
+        self.cursor_controller.scroll(&self.editor_rows);
         queue!(self.editor_contents, cursor::Hide, cursor::MoveTo(0, 0))?;
         self.draw_rows();
-        let cursor_x = self.cursor_controller.cursor_x;
-        let cursor_y = self.cursor_controller.cursor_y;
+        self.draw_status_line();
+        self.draw_status_message();
+        let cursor_x = self.cursor_controller.render_x - self.cursor_controller.col_offset + self.max_line_nr_digits + 1;
+        let cursor_y = self.cursor_controller.cursor_y - self.cursor_controller.row_offset;
         queue!(
             self.editor_contents,
             cursor::MoveTo(cursor_x as u16, cursor_y as u16),
             cursor::Show
         )?;
-        self.editor_contents.flush() /* add this line*/
+        self.editor_contents.flush()
     }
 
     fn move_cursor(&mut self, direction: KeyCode) {
-        self.cursor_controller.move_cursor(direction);
+        self.cursor_controller
+            .move_cursor(direction, &self.editor_rows);
+    }
+
+    fn jump_cursor(&mut self, direction: KeyCode) {
+        self.cursor_controller
+            .jump_cursor(direction, &self.win_size, &self.editor_rows);
     }
 }
 
@@ -109,6 +248,11 @@ struct CursorController {
     cursor_y: usize,
     screen_cols: usize,
     screen_rows: usize,
+    row_offset: usize,
+    col_offset: usize,
+    render_x: usize,
+
+    prev_cursor_x: usize,
 }
 
 impl CursorController {
@@ -118,18 +262,88 @@ impl CursorController {
             cursor_y: 0,
             screen_cols: win_size.0,
             screen_rows: win_size.1,
+            row_offset: 0,
+            col_offset: 0,
+            render_x: 0,
+
+            prev_cursor_x: 0,
         }
     }
 
-    fn move_cursor(&mut self, direction: KeyCode) {
+    fn get_render_x(&self, row: &Row) -> usize {
+        row.row_content[..self.cursor_x]
+            .chars()
+            .fold(0, |render_x, c|{
+                if c == '\t' {
+                    render_x + (TAB_STOP - 1) - (render_x % TAB_STOP) + 1 
+                } else {
+                    render_x + 1
+                }
+            })
+    }
+
+    fn scroll(&mut self, editor_rows: &EditorRows) {
+        self.render_x = 0;
+
+        if self.cursor_y < editor_rows.nr_of_rows() {
+            self.render_x = self.get_render_x(editor_rows.get_editor_row(self.cursor_y))
+        }
+
+        self.row_offset = cmp::min(self.row_offset, self.cursor_y);
+        if self.cursor_y >= self.row_offset + self.screen_rows {
+            self.row_offset = self.cursor_y - self.screen_rows + 1;
+        }
+
+        self.col_offset = cmp::min(self.col_offset, self.render_x);
+        if self.render_x >= self.col_offset + self.screen_cols {
+            self.col_offset = self.render_x - self.screen_cols + 1;
+        }
+    }
+
+    fn jump_cursor(&mut self, direction: KeyCode, win_size: &(usize, usize), editor_rows: &EditorRows) {
+        let screen_rows = win_size.1;
+        // let screen_cols = win_size.0;
+
         match direction {
-            KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Char('L') => { // cursor to bottom with no scroll
+                self.cursor_y = cmp::min(screen_rows - 1 + self.row_offset, editor_rows.nr_of_rows() - 1);
+            }
+            KeyCode::Char('d') => { // cursor half-page down with scroll
+                self.cursor_y = cmp::min((screen_rows - 2) / 2 + 1 + self.row_offset, editor_rows.nr_of_rows() - 1);
+
+                if editor_rows.nr_of_rows() > screen_rows + self.row_offset {
+                    self.row_offset = self.cursor_y;
+                }
+            }
+            KeyCode::Char('f') => { // cursor full page down with scroll
+                self.cursor_y = cmp::min(screen_rows - 2 + self.row_offset, editor_rows.nr_of_rows() - 1);
+                self.row_offset = self.cursor_y;
+            }
+
+            KeyCode::Char('H') => { // cursor to bottom with no scroll
+                self.cursor_y = self.row_offset;
+            }
+            _ => unimplemented!()
+        }
+
+    }
+
+    fn move_cursor(&mut self, direction: KeyCode, editor_rows: &EditorRows) {
+        let nr_of_rows = editor_rows.nr_of_rows();
+
+        match direction {
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
                 if self.cursor_x > 0 {
                     self.cursor_x -= 1;
-                } 
+                    self.prev_cursor_x = self.cursor_x;
+                } else if direction == KeyCode::Backspace && self.cursor_y > 0 {
+                    self.cursor_y -= 1;
+                    self.cursor_x = editor_rows.get_render(self.cursor_y).len();
+                    self.prev_cursor_x = self.cursor_x;
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.cursor_y < self.screen_rows - 1{
+                if self.cursor_y < nr_of_rows - 1 {
                     self.cursor_y += 1;
                 }
             }
@@ -140,11 +354,45 @@ impl CursorController {
                 }
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                if self.cursor_x < self.screen_cols - 1{
+                // if self.cursor_x < self.screen_cols - 1 {
+                if self.cursor_y < nr_of_rows && self.cursor_x < editor_rows.get_render(self.cursor_y).len() {
                     self.cursor_x += 1;
+
+                    if self.prev_cursor_x < editor_rows.get_render(self.cursor_y).len() - 1 {
+                        // without this condition the prev_cursor_x will update past the last char for 
+                        // some reason -- just placing - 1 in the previous condition crashes the program
+                        // when trying to move right on empty lines
+                        self.prev_cursor_x = self.cursor_x;
+                    }
                 }
             }
+            KeyCode::Char('$') => {
+                if self.cursor_y < nr_of_rows {
+                    self.cursor_x = editor_rows.get_render(self.cursor_y).len();
+                    self.prev_cursor_x = self.cursor_x;
+                }
+            }
+            KeyCode::Char('0') => {
+                self.cursor_x = 0;
+                self.prev_cursor_x = self.cursor_x;
+            }
             _ => unimplemented!(),
+        }
+
+        let row_len = if self.cursor_y < nr_of_rows {
+            editor_rows.get_render(self.cursor_y).len()
+        } else {
+            0
+        };
+
+        self.cursor_x = if self.prev_cursor_x < row_len  { 
+            self.prev_cursor_x
+        } else {
+            if row_len == 0 {
+                0
+            } else {
+                row_len - 1
+            }
         }
     }
 }
@@ -202,36 +450,100 @@ impl io::Write for EditorContents {
     }
 }
 
+#[derive(Default)]
+struct Row {
+    row_content: String,
+    render: String,
+}
+
+impl Row {
+    fn new(row_content: String, render: String ) -> Self {
+        Self {
+            row_content,
+            render,
+        }
+    }
+
+    fn insert_char(&mut self, idx: usize, ch: char) {
+        self.row_content.insert(idx, ch);
+        EditorRows::render_row(self)
+    }
+}
+
 struct EditorRows {
-    row_contents: Vec<Box<str>>,
+    row_contents: Vec<Row>,
+    file_name: Option<PathBuf>,
 }
 
 impl EditorRows {
     fn new() -> Self {
-        let mut arg = env::args();
-
-        match arg.nth(1) {
+        match env::args().nth(1) {
             None => Self {
                 row_contents: Vec::new(),
+                file_name: None,
             },
-            Some(file) => Self::from_file(file.as_ref()),
+            Some(file) => Self::from_file(file.into()),
         }
 
     }
 
-    fn from_file(file: &Path) -> Self {
-        let file_contents = fs::read_to_string(file).expect("Failed to read file");
+    fn from_file(file: PathBuf) -> Self {
+        let file_contents = fs::read_to_string(&file).expect("Failed to read file");
         Self {
-            row_contents: file_contents.lines().map(|it| it.into()).collect(),
+            file_name: Some(file),
+            row_contents: file_contents
+                .lines()
+                .map(|it| {
+                    let mut row = Row::new(it.into(), String::new());
+                    Self::render_row(&mut row);
+                    row
+                })
+                .collect(),
         }
+    }
+
+    fn get_render(&self, idx: usize) -> &String {
+        &self.row_contents[idx].render
+    }
+    
+    fn get_editor_row_mut(&mut self, idx: usize) -> &mut Row {
+        &mut self.row_contents[idx]
+    }
+
+    fn get_editor_row(&self, idx: usize) -> &Row {
+        &self.row_contents[idx]
     }
     
     fn nr_of_rows(&self) -> usize {
         self.row_contents.len()
     }
 
-    fn get_row(&self, idx:usize ) -> &str {
-        &self.row_contents[idx]
+    fn insert_row(&mut self) {
+        self.row_contents.push(Row::default());
+    }
+
+    // fn get_row(&self, idx:usize ) -> &str {
+    //     &self.row_contents[idx]
+    // }
+
+    fn render_row(row: &mut Row) {
+        let mut idx = 0;
+        let cap = row.row_content.chars()
+            .fold(0, |acc, next| acc + if next == 't' { TAB_STOP } else { 1 });
+
+        row.render = String::with_capacity(cap);
+        row.row_content.chars().for_each(|c| {
+            idx += 1;
+            if c == '\t' {
+                row.render.push(' ');
+                while idx % TAB_STOP != 0 {
+                    row.render.push(' ');
+                    idx += 1
+                }
+            } else {
+                row.render.push(c);
+            }
+        })
     }
 }
 
@@ -257,15 +569,30 @@ impl Editor {
                 state: _,
             } => return Ok(false),
             KeyEvent {
-                code: direction @ ( KeyCode::Left   | KeyCode::Char('h') |
+                code: direction @ ( KeyCode::Char('H') | KeyCode::Char('L')),   // high | low (jump w/o scroll)
+                modifiers: KeyModifiers::SHIFT,
+                kind: _,
+                state: _,
+            } => self.output.jump_cursor(direction),
+            KeyEvent {
+                code: direction @ ( KeyCode::Left   | KeyCode::Char('h') | KeyCode::Backspace |
                                     KeyCode::Down   | KeyCode::Char('j') |
                                     KeyCode::Up     | KeyCode::Char('k') |
-                                    KeyCode::Right  | KeyCode::Char('l')
+                                    KeyCode::Right  | KeyCode::Char('l') |
+                                    KeyCode::Char('$') | KeyCode::Char('0')
                 ),
                 modifiers: KeyModifiers::NONE,
                 kind: _,
                 state: _,
             } => self.output.move_cursor(direction),
+            KeyEvent {
+                code: direction @ ( KeyCode::Char('b') | KeyCode::Char('u') |   // vim PgUp | half PgUp
+                                    KeyCode::Char('f') | KeyCode::Char('d')    // vim PgDn | half PgDn
+                ),
+                modifiers: KeyModifiers::CONTROL,
+                kind: _,
+                state: _,
+            } => self.output.jump_cursor(direction),
             _ => {}
         }
         Ok(true)
@@ -280,31 +607,9 @@ impl Editor {
 fn main() -> io::Result<()> {
     let _clean_up = CleanUp;
     terminal::enable_raw_mode()?;
-    /* modify */
+
     let mut editor = Editor::new();
     while editor.run()? {}
-    /* end */
+
     Ok(())
 }
-
-// fn main() {
-//     let _clean_up = CleanUp;
-//     terminal::enable_raw_mode().expect("Could not turn on Raw mode");
-//     /* add the following */
-//     loop {
-//         if let Event::Key(event) = event::read().expect("Failed to read line") {
-//             match event {
-//                 KeyEvent {
-//                     code: KeyCode::Char('q'),
-//                     modifiers: event::KeyModifiers::CONTROL,
-//                     kind: _,
-//                     state: _,
-//                 } => break,
-//                 _ => {
-//                     //todo
-//                 }
-//             }
-//             println!("{:?}\r", event.code);
-//         };
-//     }
-// }
