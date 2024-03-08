@@ -1,14 +1,16 @@
-use crossterm::{event::*, terminal::ClearType};
+// use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+// use ratatui::{backend::CrosstermBackend, Terminal};
 use crossterm::{cursor, event, execute, queue, style, terminal};
+use crossterm::{event::*, terminal::ClearType};
+use std::cmp;
 use std::time::{Duration, Instant};
 use std::{
     env,
     fs,
+    io::{self, stdout, Write},
     // vec,
     path::PathBuf,
-    io::{self, Write, stdout}
 };
-use std::cmp;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NAME: &str = env!("CARGO_PKG_NAME");
@@ -55,7 +57,6 @@ impl StatusMessage {
             }
         })
     }
-    
 }
 
 struct Output {
@@ -64,7 +65,7 @@ struct Output {
     editor_rows: EditorRows,
     cursor_controller: CursorController,
     status_message: StatusMessage,
-    max_line_nr_digits: usize,
+    line_nr_padding: usize,
 }
 
 impl Output {
@@ -74,14 +75,15 @@ impl Output {
             .unwrap();
         let mut out = Self {
             win_size,
-            max_line_nr_digits: 0,
+            line_nr_padding: 0,
             editor_contents: EditorContents::new(),
             editor_rows: EditorRows::new(),
             cursor_controller: CursorController::new(win_size),
             status_message: StatusMessage::new(HELP_MSG.into()),
         };
-        
-        out.max_line_nr_digits = out.editor_rows.nr_of_rows().checked_ilog10().unwrap_or(0) as usize + 1; // god I love rust
+
+        out.line_nr_padding =
+            out.editor_rows.nr_of_rows().checked_ilog10().unwrap_or(0) as usize + 2; // god I love rust
 
         out
     }
@@ -107,7 +109,7 @@ impl Output {
             .push_str(&style::Attribute::Reverse.to_string());
 
         let status = format!(
-            "{} -- {} ", 
+            "{} -- {} ",
             self.editor_rows
                 .file_name
                 .as_ref()
@@ -132,7 +134,7 @@ impl Output {
             }
             self.editor_contents.push(' ')
         }
-        
+
         self.editor_contents
             .push_str(&style::Attribute::Reset.to_string());
 
@@ -176,24 +178,35 @@ impl Output {
                     self.editor_contents.push('~');
                     // self.editor_contents.push_str(&((i + 1).to_string() + "  "));
                 }
-
             } else {
                 let row = self.editor_rows.get_render(file_row);
                 let col_offset = self.cursor_controller.col_offset;
-                let line_nr_str = (i + 1 + self.cursor_controller.row_offset).to_string();
-                let line_nr_formatted = format!("{:>pad$}{}",
-                                                line_nr_str,
-                                                " ",
-                                                pad = self.max_line_nr_digits);
+                let row_offset = self.cursor_controller.row_offset;
+                let line_nr = i + row_offset + 1;
+                let cursor_y = self.cursor_controller.cursor_y;
 
-                self.editor_contents.push_str(&(line_nr_formatted)); // vim :set nornu basically
+                if cursor_y == line_nr - 1 {
+                    let line_nr_str = line_nr.to_string();
 
+                    let line_nr_formatted =
+                        format!("{:<pad$} ", line_nr_str, pad = self.line_nr_padding);
+
+                    self.editor_contents.push_str(&(line_nr_formatted));
+                } else {
+                    let rel_line_nr = (i + row_offset).abs_diff(cursor_y);
+
+                    let rel_line_nr_str = rel_line_nr.to_string();
+                    let rel_line_nr_formatted =
+                        format!("{:>pad$} ", rel_line_nr_str, pad = self.line_nr_padding);
+
+                    self.editor_contents.push_str(&(rel_line_nr_formatted)); // vim :set nornu basically
+                }
                 let len = if row.len() < col_offset {
                     0
                 } else {
                     let len = row.len() - col_offset;
                     if len > screen_cols {
-                        screen_cols 
+                        screen_cols
                     } else {
                         len
                     }
@@ -201,17 +214,17 @@ impl Output {
 
                 let start = if len == 0 { 0 } else { col_offset };
 
-                self.editor_contents
-                    .push_str(&(row[start..start + len]));
+                self.editor_contents.push_str(&(row[start..start + len]));
             }
 
             queue!(
                 self.editor_contents,
                 terminal::Clear(ClearType::UntilNewLine)
-            ).unwrap();
+            )
+            .unwrap();
 
             // if i < screen_rows - 1 {
-                self.editor_contents.push_str("\r\n");
+            self.editor_contents.push_str("\r\n");
             // }
         }
     }
@@ -222,7 +235,9 @@ impl Output {
         self.draw_rows();
         self.draw_status_line();
         self.draw_status_message();
-        let cursor_x = self.cursor_controller.render_x - self.cursor_controller.col_offset + self.max_line_nr_digits + 1;
+        let cursor_x = self.cursor_controller.render_x - self.cursor_controller.col_offset
+            + self.line_nr_padding
+            + 1;
         let cursor_y = self.cursor_controller.cursor_y - self.cursor_controller.row_offset;
         queue!(
             self.editor_contents,
@@ -273,9 +288,9 @@ impl CursorController {
     fn get_render_x(&self, row: &Row) -> usize {
         row.row_content[..self.cursor_x]
             .chars()
-            .fold(0, |render_x, c|{
+            .fold(0, |render_x, c| {
                 if c == '\t' {
-                    render_x + (TAB_STOP - 1) - (render_x % TAB_STOP) + 1 
+                    render_x + (TAB_STOP - 1) - (render_x % TAB_STOP) + 1
                 } else {
                     render_x + 1
                 }
@@ -300,32 +315,81 @@ impl CursorController {
         }
     }
 
-    fn jump_cursor(&mut self, direction: KeyCode, win_size: &(usize, usize), editor_rows: &EditorRows) {
+    fn jump_cursor(
+        &mut self,
+        direction: KeyCode,
+        win_size: &(usize, usize),
+        editor_rows: &EditorRows,
+    ) {
         let screen_rows = win_size.1;
+        let eof = editor_rows.nr_of_rows() - 1;
         // let screen_cols = win_size.0;
 
         match direction {
-            KeyCode::Char('L') => { // cursor to bottom with no scroll
-                self.cursor_y = cmp::min(screen_rows - 1 + self.row_offset, editor_rows.nr_of_rows() - 1);
+            KeyCode::Char('L') => {
+                // cursor to bottom with no scroll
+                self.cursor_y = cmp::min(
+                    screen_rows - 1 + self.row_offset,
+                    editor_rows.nr_of_rows() - 1,
+                );
             }
-            KeyCode::Char('d') => { // cursor half-page down with scroll
-                self.cursor_y = cmp::min((screen_rows - 2) / 2 + 1 + self.row_offset, editor_rows.nr_of_rows() - 1);
+            KeyCode::Char('d') => {
+                // cursor half-page down with scroll
+                // let half_jump = if self.row_offset > 0 {
+                //     (self.cursor_y - self.row_offset) / 2;
+                // } else {
+                //     self.cursor_y - 1
+                // };
+                self.cursor_y = cmp::min((screen_rows - 2) / 2 + 1 + self.row_offset, eof);
 
-                if editor_rows.nr_of_rows() > screen_rows + self.row_offset {
+                if screen_rows < eof - self.row_offset {
+                    // if eof > screen_rows + self.row_offset || self.cursor_y + half_jump < eof {
                     self.row_offset = self.cursor_y;
                 }
             }
-            KeyCode::Char('f') => { // cursor full page down with scroll
-                self.cursor_y = cmp::min(screen_rows - 2 + self.row_offset, editor_rows.nr_of_rows() - 1);
-                self.row_offset = self.cursor_y;
-            }
+            KeyCode::Char('f') => {
+                // cursor full page down with scroll
+                // determines if cursor jumps
+                let offset = if screen_rows <= eof - self.row_offset {
+                    2
+                } else {
+                    1
+                };
 
-            KeyCode::Char('H') => { // cursor to bottom with no scroll
+                self.cursor_y = cmp::min(screen_rows - offset + self.row_offset, eof);
+
+                self.row_offset = self.cursor_y;
+            } // edge case where cursor should jump to EOF but didn't
+
+            KeyCode::Char('H') => {
+                // cursor to top with no scroll
                 self.cursor_y = self.row_offset;
             }
-            _ => unimplemented!()
+            KeyCode::Char('u') => {
+                // cursor half-page up with scroll
+                let half_screen = if self.row_offset > 0 {
+                    (self.cursor_y - self.row_offset) / 2
+                } else {
+                    self.cursor_y - 1
+                };
+                self.cursor_y = cmp::max(half_screen + self.row_offset, 0);
+
+                // if editor_rows.nr_of_rows() > screen_rows + self.row_offset {
+                self.row_offset -= half_screen;
+                // }
+            }
+            KeyCode::Char('b') => {
+                // cursor full page up with scroll
+                self.cursor_y = cmp::min(screen_rows - 2 + self.row_offset, eof);
+                self.row_offset = self.cursor_y;
+            }
+            _ => unimplemented!(),
         }
 
+        self.cursor_x = cmp::min(
+            self.prev_cursor_x,
+            editor_rows.get_render(self.cursor_y).len() - 1,
+        );
     }
 
     fn move_cursor(&mut self, direction: KeyCode, editor_rows: &EditorRows) {
@@ -355,11 +419,13 @@ impl CursorController {
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 // if self.cursor_x < self.screen_cols - 1 {
-                if self.cursor_y < nr_of_rows && self.cursor_x < editor_rows.get_render(self.cursor_y).len() {
+                if self.cursor_y < nr_of_rows
+                    && self.cursor_x < editor_rows.get_render(self.cursor_y).len()
+                {
                     self.cursor_x += 1;
 
                     if self.prev_cursor_x < editor_rows.get_render(self.cursor_y).len() - 1 {
-                        // without this condition the prev_cursor_x will update past the last char for 
+                        // without this condition the prev_cursor_x will update past the last char for
                         // some reason -- just placing - 1 in the previous condition crashes the program
                         // when trying to move right on empty lines
                         self.prev_cursor_x = self.cursor_x;
@@ -385,7 +451,7 @@ impl CursorController {
             0
         };
 
-        self.cursor_x = if self.prev_cursor_x < row_len  { 
+        self.cursor_x = if self.prev_cursor_x < row_len {
             self.prev_cursor_x
         } else {
             if row_len == 0 {
@@ -457,7 +523,7 @@ struct Row {
 }
 
 impl Row {
-    fn new(row_content: String, render: String ) -> Self {
+    fn new(row_content: String, render: String) -> Self {
         Self {
             row_content,
             render,
@@ -484,7 +550,6 @@ impl EditorRows {
             },
             Some(file) => Self::from_file(file.into()),
         }
-
     }
 
     fn from_file(file: PathBuf) -> Self {
@@ -505,7 +570,7 @@ impl EditorRows {
     fn get_render(&self, idx: usize) -> &String {
         &self.row_contents[idx].render
     }
-    
+
     fn get_editor_row_mut(&mut self, idx: usize) -> &mut Row {
         &mut self.row_contents[idx]
     }
@@ -513,7 +578,7 @@ impl EditorRows {
     fn get_editor_row(&self, idx: usize) -> &Row {
         &self.row_contents[idx]
     }
-    
+
     fn nr_of_rows(&self) -> usize {
         self.row_contents.len()
     }
@@ -528,7 +593,9 @@ impl EditorRows {
 
     fn render_row(row: &mut Row) {
         let mut idx = 0;
-        let cap = row.row_content.chars()
+        let cap = row
+            .row_content
+            .chars()
             .fold(0, |acc, next| acc + if next == 't' { TAB_STOP } else { 1 });
 
         row.render = String::with_capacity(cap);
@@ -606,7 +673,16 @@ impl Editor {
 
 fn main() -> io::Result<()> {
     let _clean_up = CleanUp;
+
     terminal::enable_raw_mode()?;
+
+    // let mut stdout = stdout();
+    // execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    //
+    // let backend = CrosstermBackend::new(stdout);
+    // let mut terminal = Terminal::new(backend)?;
+    //
+    // terminal.clear()?;
 
     let mut editor = Editor::new();
     while editor.run()? {}
