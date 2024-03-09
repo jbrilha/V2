@@ -1,9 +1,10 @@
 // use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 // use ratatui::{backend::CrosstermBackend, Terminal};
+use core::panic;
 use crossterm::{cursor, event, execute, queue, style, terminal};
 use crossterm::{event::*, terminal::ClearType};
-use std::cmp;
 use std::time::{Duration, Instant};
+use std::{cmp, isize, usize};
 use std::{
     env,
     fs,
@@ -41,7 +42,7 @@ impl StatusMessage {
         }
     }
 
-    fn set_message(&mut self, message: String) {
+    fn _set_message(&mut self, message: String) {
         self.message = Some(message);
         self.set_time = Some(Instant::now())
     }
@@ -93,7 +94,7 @@ impl Output {
         execute!(stdout(), cursor::MoveTo(0, 0))
     }
 
-    fn insert_char(&mut self, ch: char) {
+    fn _insert_char(&mut self, ch: char) {
         if self.cursor_controller.cursor_y == self.editor_rows.nr_of_rows() {
             self.editor_rows.insert_row()
         }
@@ -323,65 +324,48 @@ impl CursorController {
     ) {
         let screen_rows = win_size.1;
         let eof = editor_rows.nr_of_rows() - 1;
-        // let screen_cols = win_size.0;
+        let half_jump = screen_rows / 2; /* + self.row_offset + 1;*/
+        // let jump = screen_rows;
 
         match direction {
-            KeyCode::Char('L') => {
-                // cursor to bottom with no scroll
-                self.cursor_y = cmp::min(
-                    screen_rows - 1 + self.row_offset,
-                    editor_rows.nr_of_rows() - 1,
-                );
-            }
+            // cursor jumps, no offset change
+            KeyCode::Char('L') => self.cursor_y = cmp::min(screen_rows + self.row_offset - 1, eof),
+            KeyCode::Char('H') => self.cursor_y = self.row_offset,
+
+            // half jumps, offset needs to adapt
             KeyCode::Char('d') => {
-                // cursor half-page down with scroll
-                // let half_jump = if self.row_offset > 0 {
-                //     (self.cursor_y - self.row_offset) / 2;
-                // } else {
-                //     self.cursor_y - 1
-                // };
-                self.cursor_y = cmp::min((screen_rows - 2) / 2 + 1 + self.row_offset, eof);
-
-                if screen_rows < eof - self.row_offset {
-                    // if eof > screen_rows + self.row_offset || self.cursor_y + half_jump < eof {
-                    self.row_offset = self.cursor_y;
-                }
-            }
-            KeyCode::Char('f') => {
-                // cursor full page down with scroll
-                // determines if cursor jumps
-                let offset = if screen_rows <= eof - self.row_offset {
-                    2
-                } else {
-                    1
-                };
-
-                self.cursor_y = cmp::min(screen_rows - offset + self.row_offset, eof);
-
-                self.row_offset = self.cursor_y;
-            } // edge case where cursor should jump to EOF but didn't
-
-            KeyCode::Char('H') => {
-                // cursor to top with no scroll
-                self.cursor_y = self.row_offset;
+                self.cursor_y = cmp::min(self.cursor_y + half_jump, eof);
+                self.row_offset = cmp::min(self.cursor_y, eof - screen_rows - 1);
             }
             KeyCode::Char('u') => {
-                // cursor half-page up with scroll
-                let half_screen = if self.row_offset > 0 {
-                    (self.cursor_y - self.row_offset) / 2
-                } else {
-                    self.cursor_y - 1
-                };
-                self.cursor_y = cmp::max(half_screen + self.row_offset, 0);
+                let ro_is = self.row_offset as isize;
+                let cy_is = self.cursor_y as isize;
+                let hj_is = half_jump as isize;
 
-                // if editor_rows.nr_of_rows() > screen_rows + self.row_offset {
-                self.row_offset -= half_screen;
-                // }
+                self.cursor_y = cmp::max(cy_is - hj_is, 0) as usize;
+                self.row_offset = cmp::max(ro_is - hj_is, 0) as usize;
+            }
+
+            KeyCode::Char('f') => {
+                self.cursor_y = if self.cursor_y + screen_rows > eof {
+                    eof
+                } else {
+                    screen_rows - 2 + self.row_offset
+                };
+                self.row_offset = self.cursor_y;
             }
             KeyCode::Char('b') => {
-                // cursor full page up with scroll
-                self.cursor_y = cmp::min(screen_rows - 2 + self.row_offset, eof);
-                self.row_offset = self.cursor_y;
+                let ro_is = self.row_offset as isize;
+
+                self.cursor_y = if self.row_offset == 0 {
+                    self.cursor_y
+                } else if self.cursor_y < self.row_offset + screen_rows - 1 {
+                    self.row_offset + 1
+                } else {
+                    self.cursor_y - screen_rows + 2
+                };
+
+                self.row_offset = cmp::max(ro_is - screen_rows as isize, 0) as usize;
             }
             _ => unimplemented!(),
         }
