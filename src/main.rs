@@ -1,6 +1,7 @@
 // use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 // use ratatui::{backend::CrosstermBackend, Terminal};
 use core::panic;
+use std::io::ErrorKind;
 use crossterm::{cursor, event, execute, queue, style, terminal};
 use crossterm::{event::*, terminal::ClearType};
 use std::time::{Duration, Instant};
@@ -16,9 +17,10 @@ use std::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NAME: &str = env!("CARGO_PKG_NAME");
 const TAB_STOP: usize = 4;
-const MSG_TTL: u64 = 5;
+const MSG_TTL: u64 = 1;
 const NO_FILE_NAME: &str = "[No Name]";
 const HELP_MSG: &str = "Ctrl + Q to Quit";
+const DIRTY: &str = "Unsaved changes!";
 
 struct CleanUp;
 
@@ -42,7 +44,7 @@ impl StatusMessage {
         }
     }
 
-    fn _set_message(&mut self, message: String) {
+    fn set_message(&mut self, message: String) {
         self.message = Some(message);
         self.set_time = Some(Instant::now())
     }
@@ -67,6 +69,7 @@ struct Output {
     cursor_controller: CursorController,
     status_message: StatusMessage,
     line_nr_padding: usize,
+    dirty: u8,
 }
 
 impl Output {
@@ -81,6 +84,7 @@ impl Output {
             editor_rows: EditorRows::new(),
             cursor_controller: CursorController::new(win_size),
             status_message: StatusMessage::new(HELP_MSG.into()),
+            dirty: 0,
         };
 
         out.line_nr_padding =
@@ -94,14 +98,16 @@ impl Output {
         execute!(stdout(), cursor::MoveTo(0, 0))
     }
 
-    fn _insert_char(&mut self, ch: char) {
+    fn insert_char(&mut self, ch: char) {
         if self.cursor_controller.cursor_y == self.editor_rows.nr_of_rows() {
-            self.editor_rows.insert_row()
+            self.editor_rows.insert_row();
+            self.dirty = 1;
         }
         self.editor_rows
             .get_editor_row_mut(self.cursor_controller.cursor_y)
             .insert_char(self.cursor_controller.cursor_x, ch);
         self.cursor_controller.cursor_x += 1;
+        self.dirty = 1;
         // self.cursor_controller.prev_cursor_x = self.cursor_controller.cursor_x;
     }
 
@@ -110,13 +116,14 @@ impl Output {
             .push_str(&style::Attribute::Reverse.to_string());
 
         let status = format!(
-            "{} -- {} ",
+            "{}{} -- {} ",
             self.editor_rows
                 .file_name
                 .as_ref()
                 .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str())
                 .unwrap_or(NO_FILE_NAME),
+            if self.dirty > 0 {"*"} else {""},
             self.editor_rows.nr_of_rows()
         );
         let status_len = cmp::min(status.len(), self.win_size.0);
@@ -324,18 +331,19 @@ impl CursorController {
     ) {
         let screen_rows = win_size.1;
         let eof = editor_rows.nr_of_rows() - 1;
-        let half_jump = screen_rows / 2; /* + self.row_offset + 1;*/
-        // let jump = screen_rows;
+        let half_jump = screen_rows / 2;
 
         match direction {
-            // cursor jumps, no offset change
             KeyCode::Char('L') => self.cursor_y = cmp::min(screen_rows + self.row_offset - 1, eof),
             KeyCode::Char('H') => self.cursor_y = self.row_offset,
 
-            // half jumps, offset needs to adapt
             KeyCode::Char('d') => {
                 self.cursor_y = cmp::min(self.cursor_y + half_jump, eof);
-                self.row_offset = cmp::min(self.cursor_y, eof - screen_rows - 1);
+                self.row_offset = if eof <= self.row_offset + screen_rows {
+                    self.row_offset
+                } else {
+                    cmp::min(self.row_offset + half_jump, eof - screen_rows + 1)
+                }
             }
             KeyCode::Char('u') => {
                 let ro_is = self.row_offset as isize;
@@ -347,12 +355,12 @@ impl CursorController {
             }
 
             KeyCode::Char('f') => {
+                self.row_offset = cmp::min(self.row_offset + screen_rows - 1, eof);
                 self.cursor_y = if self.cursor_y + screen_rows > eof {
                     eof
                 } else {
-                    screen_rows - 2 + self.row_offset
+                    self.row_offset - 1
                 };
-                self.row_offset = self.cursor_y;
             }
             KeyCode::Char('b') => {
                 let ro_is = self.row_offset as isize;
@@ -366,6 +374,9 @@ impl CursorController {
                 };
 
                 self.row_offset = cmp::max(ro_is - screen_rows as isize, 0) as usize;
+                if ro_is == eof as isize {
+                    self.cursor_y -= 2
+                }
             }
             _ => unimplemented!(),
         }
@@ -396,13 +407,11 @@ impl CursorController {
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                // self.cursor_y = self.cursor_y.saturating_sub(1);
                 if self.cursor_y > 0 {
                     self.cursor_y -= 1;
                 }
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                // if self.cursor_x < self.screen_cols - 1 {
                 if self.cursor_y < nr_of_rows
                     && self.cursor_x < editor_rows.get_render(self.cursor_y).len()
                 {
@@ -418,7 +427,7 @@ impl CursorController {
             }
             KeyCode::Char('$') => {
                 if self.cursor_y < nr_of_rows {
-                    self.cursor_x = editor_rows.get_render(self.cursor_y).len();
+                    self.cursor_x = editor_rows.get_editor_row(self.cursor_y).row_content.len();
                     self.prev_cursor_x = self.cursor_x;
                 }
             }
@@ -426,8 +435,17 @@ impl CursorController {
                 self.cursor_x = 0;
                 self.prev_cursor_x = self.cursor_x;
             }
+            KeyCode::Char('_') => {
+                if self.cursor_y < nr_of_rows {
+                    let row = &editor_rows.get_editor_row(self.cursor_y).row_content;
+                    self.cursor_x = row.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+                    self.prev_cursor_x = self.cursor_x;
+                }
+            }
             _ => unimplemented!(),
         }
+
+        // fn move_cursor_to_content()
 
         let row_len = if self.cursor_y < nr_of_rows {
             editor_rows.get_render(self.cursor_y).len()
@@ -536,6 +554,27 @@ impl EditorRows {
         }
     }
 
+    fn save(&self) -> io::Result<usize> {
+        match &self.file_name {
+            None => Err(io::Error::new(ErrorKind::Other, "no file name!")),
+            Some(name) => {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(name)?;
+                let contents: String = self
+                    .row_contents
+                    .iter()
+                    .map(|it| it.row_content.as_str())
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                file.set_len(contents.len() as u64)?;
+                file.write_all(contents.as_bytes())?;
+                Ok(contents.as_bytes().len())
+            }
+        }
+    }
+
     fn from_file(file: PathBuf) -> Self {
         let file_contents = fs::read_to_string(&file).expect("Failed to read file");
         Self {
@@ -601,6 +640,7 @@ impl EditorRows {
 struct Editor {
     reader: Reader,
     output: Output,
+    command: String,
 }
 
 impl Editor {
@@ -608,19 +648,101 @@ impl Editor {
         Self {
             reader: Reader,
             output: Output::new(),
+            command: String::new(),
         }
+    }
+
+    fn save_file(&mut self) -> io::Result<bool> {
+        match self.output.editor_rows.save() {
+            Ok(len) => {
+                self.output
+                    .status_message
+                    .set_message(format!("{}B written", len));
+                self.output.dirty = 0;
+                Ok(true)
+            }
+            Err(error) => {
+                self.output
+                    .status_message
+                    .set_message(format!("Something went wrong :("));
+                Err(error)
+            }
+        }
+    }
+
+    fn quit(&mut self) -> io::Result<bool> {
+        if self.output.dirty > 0 {
+            self.output.status_message.set_message(DIRTY.into());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn parse_command(&mut self, command: String) -> io::Result<bool> {
+        if command == "w" {
+            return self.save_file()
+            // return Ok(true)
+        }
+        if command == "q" {
+            return self.quit();
+        }
+        if command == "wq" {
+            match self.save_file() {
+                Ok(..) => return Ok(false),
+                Err(error) => return Err(error)
+            }
+        }
+        Ok(true)
+    }
+
+    fn process_command(&mut self) -> io::Result<bool> {
+        self.command.clear();
+        loop {
+            match self.reader.read_key()? {
+                KeyEvent {
+                    code: ch @ (KeyCode::Char(..) | KeyCode::Esc | KeyCode::Enter ),
+                    modifiers: KeyModifiers::NONE,
+                    kind: _,
+                    state: _ 
+                } => {
+                        match ch { 
+                            KeyCode::End => return Ok(true),
+                            KeyCode::Enter => break,
+                            KeyCode::Char(ch) => { 
+                                self.command.push(ch)
+                            }
+                            _ => unimplemented!()
+                        }
+                    }
+                _ => unimplemented!()
+            }
+        }
+
+        self.parse_command(self.command.to_string())
     }
 
     fn process_keypress(&mut self) -> io::Result<bool> {
         match self.reader.read_key()? {
             KeyEvent {
+                code: KeyCode::Char(':'),
+                modifiers: KeyModifiers::NONE,
+                kind: _,
+                state: _,
+            } => return self.process_command(),
+            KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::CONTROL,
                 kind: _,
                 state: _,
-            } => return Ok(false),
+            } => return Ok(false),// { if self.output.dirty > 0 {
+            //         self.output.status_message.set_message(DIRTY.into());
+            //         return Ok(true);
+            //     }
+                 // return  Ok(false)
+            //},
             KeyEvent {
-                code: direction @ ( KeyCode::Char('H') | KeyCode::Char('L')),   // high | low (jump w/o scroll)
+                code: direction @ ( KeyCode::Char('H') | KeyCode::Char('L')  // high | low (jump w/o scroll)
+                ),
                 modifiers: KeyModifiers::SHIFT,
                 kind: _,
                 state: _,
@@ -630,7 +752,8 @@ impl Editor {
                                     KeyCode::Down   | KeyCode::Char('j') |
                                     KeyCode::Up     | KeyCode::Char('k') |
                                     KeyCode::Right  | KeyCode::Char('l') |
-                                    KeyCode::Char('$') | KeyCode::Char('0')
+                                    KeyCode::Char('$') | KeyCode::Char('0') |
+                                    KeyCode::Char('_')
                 ),
                 modifiers: KeyModifiers::NONE,
                 kind: _,
@@ -644,6 +767,15 @@ impl Editor {
                 kind: _,
                 state: _,
             } => self.output.jump_cursor(direction),
+            KeyEvent { code: code @ (KeyCode::Char(..) | KeyCode::Tab),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                kind: _,
+                state: _ 
+            } => self.output.insert_char(match code {
+                    KeyCode::Tab => '\t',
+                    KeyCode::Char(ch) => ch,
+                    _ => unreachable!(),
+                }),
             _ => {}
         }
         Ok(true)
@@ -654,6 +786,19 @@ impl Editor {
         self.process_keypress()
     }
 }
+
+// struct Command {
+//     command: String,
+// }
+//
+// impl Command {
+//     fn new() -> Self {
+//         Self {
+//             command: "",
+//         }
+//     }
+//     
+// }
 
 fn main() -> io::Result<()> {
     let _clean_up = CleanUp;
